@@ -47,7 +47,6 @@ RDS（MySQL または PostgreSQL）
 |---|---|---|
 | id | BIGINT (PK) | レコードID |
 | campaign_id | BIGINT (FK) | キャンペーンID |
-| import_id | CHAR(36) | インポートバッチID（UUID）。CSV取込単位で付与。新旧スワップに使用 |
 | email_address | VARCHAR(255) | 宛先メールアドレス |
 | status | VARCHAR(20) | 宛先ステータス（下記参照） |
 | sent_at | TIMESTAMP | 送信日時 |
@@ -76,13 +75,10 @@ CREATE INDEX idx_recipients_campaign_status
 CREATE INDEX idx_recipients_campaign_id
   ON notification_recipients (campaign_id, id);
 
-CREATE INDEX idx_recipients_campaign_import
-  ON notification_recipients (campaign_id, import_id);
 ```
 
 - `(campaign_id, status)` — ステータス別の集計・取得用（送信ワークフローの完了判定等）
 - `(campaign_id, id)` — ページネーション用（Map State でのバッチ読み取り）
-- `(campaign_id, import_id)` — CSV取込時の新旧スワップ用（旧宛先DELETE / 失敗時の新宛先DELETE）
 
 ---
 
@@ -93,13 +89,13 @@ notification_campaigns (1) ──── (N) notification_recipients
          │                              │
          ├ id (PK)                      ├ id (PK)
          ├ title                        ├ campaign_id (FK)
-         ├ subject                      ├ import_id
-         ├ body_html                    ├ email_address
-         ├ body_text                    ├ status
-         ├ from_address                 ├ sent_at
-         ├ csv_s3_key                   ├ error_message
-         ├ scheduled_at                 ├ created_at
-         ├ execution_arn                └ updated_at
+         ├ subject                      ├ email_address
+         ├ body_html                    ├ status
+         ├ body_text                    ├ sent_at
+         ├ from_address                 ├ error_message
+         ├ csv_s3_key                   ├ created_at
+         ├ scheduled_at                 └ updated_at
+         ├ execution_arn
          ├ status
          ├ total_count
          ├ sent_count

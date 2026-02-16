@@ -70,7 +70,7 @@ sequenceDiagram
 
 ## パターンB: 宛先CSV差し替え
 
-宛先を変更する場合。`import_id` を使った新旧スワップ方式で安全に入れ替える。
+宛先を変更する場合。既存宛先を全削除してから新CSVを取込む。
 メタデータの同時編集も可能。
 
 ### フロー
@@ -115,10 +115,11 @@ sequenceDiagram
         Lambda->>SFn: startExecution（非同期）
         Lambda-->>UI: { campaign_id }（即時返却）
 
-        Note over SFn, RDS: バックグラウンドで実行（import_idスワップ方式）
+        Note over SFn, RDS: バックグラウンドで実行
+        SFn->>RDS: 既存宛先DELETE
         SFn->>S3: 新CSV分割
-        SFn->>RDS: Map State: 新宛先を並列INSERT（新import_id付き）
-        SFn->>RDS: 旧宛先DELETE（旧import_id）→ status→送信予約済
+        SFn->>RDS: Map State: 新宛先を並列バッチINSERT
+        SFn->>RDS: status→送信予約済, total_count更新
         SFn->>RDS: 送信WF自動起動 + execution_arn保存
     end
     end
@@ -132,24 +133,25 @@ sequenceDiagram
 - CSV取込WF完了後、自動で status → `送信予約済` に戻り、送信WFが再起動される
 - 元の `scheduled_at` で送信WFが Wait 状態に入る
 
-### 失敗時の復元（import_id スワップ方式）
+### 失敗時のリカバリ（全削除方式）
 
-CSV取込中にエラーが発生した場合、`import_id` により新旧の宛先を区別して安全に復元する。
+CSV取込中にエラーが発生した場合、該当キャンペーンの宛先を全て削除してクリーンな状態に戻す。
 
 | 状況 | エラー処理 |
 |---|---|
-| 新宛先INSERT途中で失敗 | 新import_idの宛先のみDELETE → 旧宛先は残る |
-| ステータス復元 | `送信予約済` に戻す → 送信WF再起動 |
-| 結果 | **旧宛先データが保持され、元の送信予約状態に完全復元** |
+| 取込途中で失敗 | 全宛先DELETE（旧宛先含む）→ status → `取込失敗` |
+| スタッフの対応 | CSVを再アップロードして復旧 |
 
-※ 旧宛先を先に削除しないため、失敗時もデータロスが発生しない
+※ 既存宛先は State 0 で先に削除されるため、失敗時に旧データは残らない
 
-### CSV取込ワークフロー（登録フローと共通・import_id スワップ方式）
+### CSV取込ワークフロー（登録フローと共通）
 
 ```mermaid
 flowchart LR
-    S1[State 1<br/>新CSV分割] --> S2[State 2<br/>Map State<br/>並列INSERT<br/>新import_id付き] --> S3[State 3<br/>旧宛先DELETE<br/>→ status→送信予約済<br/>+ 送信WF自動起動]
-    S2 --> |失敗| ERR[Catch:<br/>新import_idの宛先DELETE<br/>→ 旧宛先は保持<br/>→ status復元]
+    S0[State 0<br/>既存宛先DELETE] --> S1[State 1<br/>CSV分割] --> S2[State 2<br/>Map State<br/>並列INSERT] --> S3[State 3<br/>status→送信予約済<br/>+ 送信WF自動起動]
+    S0 --> |失敗| ERR[Catch:<br/>全宛先DELETE<br/>→ status→取込失敗]
+    S1 --> |失敗| ERR
+    S2 --> |失敗| ERR
 ```
 
 ---
@@ -175,8 +177,7 @@ stateDiagram-v2
         送信予約済_B --> 取込中_B : CSV差替（送信WF停止）
         取込失敗_B --> 取込中_B : CSV差替（復旧）
         取込中_B --> 送信予約済_B2 : 成功→送信WF自動起動
-        取込中_B --> 送信予約済_B : 失敗→旧宛先保持で復元\n（送信予約済からの差替時）
-        取込中_B --> 取込失敗_B : 失敗（取込失敗からの差替時）
+        取込中_B --> 取込失敗_B : 失敗→全宛先DELETE
     }
 ```
 

@@ -103,9 +103,9 @@ sequenceDiagram
     Lambda->>SFn: startExecution（非同期）
     Lambda-->>UI: { campaign_id }（即時返却）
 
+    SFn->>RDS: 既存宛先DELETE
     SFn->>S3: CSV読取 & チャンク分割保存
-    SFn->>RDS: Map State: 宛先を並列バッチINSERT（import_id付き）
-    SFn->>RDS: 旧宛先DELETE（旧import_id）
+    SFn->>RDS: Map State: 宛先を並列バッチINSERT
     SFn->>RDS: status → 送信予約済, total_count更新
     SFn->>SFn2: startExecution（scheduled_atまで待機）
     SFn->>RDS: execution_arn保存
@@ -133,7 +133,7 @@ flowchart TD
     B5 -->|はい| B6[Step Functions: 送信WF実行停止]
     B5 -->|いいえ| B7[Step Functions: CSV取込WF起動]
     B6 --> B7
-    B7 --> B8[CSV分割 → 並列INSERT（新import_id）→ 旧宛先DELETE]
+    B7 --> B8[既存宛先DELETE → CSV分割 → 並列INSERT]
     B8 --> B9[status → 送信予約済 + 送信WF自動再起動]
     B9 --> B10([送信WFがscheduled_atまで待機])
 ```
