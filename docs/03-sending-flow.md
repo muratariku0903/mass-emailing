@@ -31,7 +31,7 @@ sequenceDiagram
     SFn->>RDS: 宛先件数取得、バッチ数計算
     SFn->>RDS: Map State: 宛先をページ単位で読取
     SFn->>SQS: 50件ずつSQSメッセージ送信
-    SFn->>RDS: 宛先status→キュー済
+    SFn->>SQS: 50件ずつSQSメッセージ送信
     end
 
     rect rgb(240, 255, 240)
@@ -52,7 +52,7 @@ sequenceDiagram
     rect rgb(245, 245, 245)
     Note over SFn, RDS: State 4-5: 完了待ち & 最終更新
     loop 60秒間隔
-        SFn->>RDS: 未完了（未送信/キュー済）の宛先件数を確認
+        SFn->>RDS: 未完了（未送信）の宛先件数を確認
     end
     SFn->>RDS: sent_count/failed_count集計、status→送信完了
     end
@@ -93,7 +93,7 @@ flowchart TD
         S3{Map State<br/>MaxConcurrency = 5}
         S3 --> E1[Lambda: RDSから宛先ページ読取]
         E1 --> E2[50件ずつSQSメッセージ送信]
-        E2 --> E3[宛先status→キュー済]
+        E2 --> E3[次のバッチへ]
     end
 
     E3 --> S4
