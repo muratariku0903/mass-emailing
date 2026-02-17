@@ -132,9 +132,12 @@ flowchart TD
 
     S3_4 --> END([ワークフロー完了])
 
-    S0 --> |エラー発生| ERR["Catch: 全宛先DELETE<br/>→ status → 取込失敗"]
-    S1 --> |エラー発生| ERR
-    S2 --> |全リトライ失敗| ERR
+    S1 --> |CSVValidationError| ERR["Catch（人為的エラーのみ）:<br/>全宛先DELETE → status → 取込失敗"]
+
+    S0 --> |システムエラー| SYS_ERR["ワークフロー異常終了<br/>status = 取込中のまま<br/>CloudWatch で検知"]
+    S1 --> |システムエラー| SYS_ERR
+    S2 --> |全リトライ失敗| SYS_ERR
+    S3 --> |システムエラー| SYS_ERR
 ```
 
 ### 処理時間の見積もり（並列処理）
@@ -147,16 +150,20 @@ flowchart TD
 | State 3 | ステータス更新 + 送信WF起動 | 約1-2秒 |
 | **合計** | | **約24-33秒** |
 
-### 失敗時のリカバリ（全削除方式）
+### 失敗時のリカバリ（エラー種別による分岐）
 
-CSV取込WF の各 State に Catch を設定し、エラー発生時は宛先を全削除してクリーンな状態に戻す。
+エラーの原因を「人為的エラー」と「システムエラー」に分類し、それぞれ異なるリカバリ方式を適用する。
 
-- WF入力: `{ campaign_id, s3_key }`
-- Step Functions の各 State に Catch を設定
-- エラー発生時 → Lambda（エラー処理）:
-  1. `DELETE FROM notification_recipients WHERE campaign_id = ?`（該当キャンペーンの宛先を全て物理削除）
+#### 人為的エラー（CSVバリデーションエラー）
+
+State 1（SplitCSV）で CSV の内容に問題がある場合、Lambda がカスタムエラー `CSVValidationError` を throw する。Step Functions の Catch でこのエラーのみを捕捉し、エラー処理 Lambda を実行する。
+
+- 対象: 不正なファイル形式、エンコーディング不一致、CSV構造不備
+- エラー処理:
+  1. `DELETE FROM notification_recipients WHERE campaign_id = ?`（全宛先を物理削除）
   2. `status` → `取込失敗` に更新
   3. CloudWatch にエラーログを出力
+- スタッフが UI で `取込失敗` を確認し、CSVを修正して再アップロード
 
 | シナリオ | 失敗時の挙動 |
 |---|---|
@@ -165,10 +172,21 @@ CSV取込WF の各 State に Catch を設定し、エラー発生時は宛先を
 
 **注意**: CSV差し替え時に失敗した場合、旧宛先データも失われる。スタッフはCSVを再アップロードする必要がある。
 
+#### システムエラー（インフラ・AWSサービス起因）
+
+RDS障害、S3障害、Lambda タイムアウト、VPC ネットワーク断などのシステム起因エラーの場合、ステータス更新自体も失敗する可能性が高いため、**ステータスは `取込中` のまま変更しない**。
+
+- 対象: RDS接続エラー、S3サービス障害、Lambda タイムアウト、VPCネットワーク障害
+- ステータス: `取込中` のまま（更新しない）
+- 検知: CloudWatch で `取込中` が一定時間（例: 30分）以上続くキャンペーンをアラーム監視
+- 対処: 運用チームがAWS障害の復旧を待ち、必要に応じて手動でリカバリ
+
+#### Map State のリトライ
+
 - Map State 内の個別チャンク失敗:
   - Retry ポリシー: MaxAttempts = 2, BackoffRate = 2.0 で自動リトライ
-  - 全リトライ失敗後は Catch でエラー処理へ遷移
-- UI 側でステータスを表示し、失敗時はスタッフに再操作を促す
+  - 全リトライ失敗後はシステムエラーとして扱い、`取込中` のまま
+- UI 側でステータスを表示し、`取込失敗` 時はスタッフに再操作を促す
 
 ### 送信WFの自動起動
 

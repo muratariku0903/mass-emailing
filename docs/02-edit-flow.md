@@ -133,25 +133,22 @@ sequenceDiagram
 - CSV取込WF完了後、自動で status → `送信予約済` に戻り、送信WFが再起動される
 - 元の `scheduled_at` で送信WFが Wait 状態に入る
 
-### 失敗時のリカバリ（全削除方式）
+### 失敗時のリカバリ（エラー種別による分岐）
 
-CSV取込中にエラーが発生した場合、該当キャンペーンの宛先を全て削除してクリーンな状態に戻す。
+| エラー種別 | エラー処理 | ステータス |
+|---|---|---|
+| 人為的エラー（CSV不正） | 全宛先DELETE → status → `取込失敗` | スタッフがCSVを修正して再アップロード |
+| システムエラー（AWS障害等） | ステータス更新なし → `取込中` のまま | 運用チームが CloudWatch で検知・対処 |
 
-| 状況 | エラー処理 |
-|---|---|
-| 取込途中で失敗 | 全宛先DELETE（旧宛先含む）→ status → `取込失敗` |
-| スタッフの対応 | CSVを再アップロードして復旧 |
-
-※ 既存宛先は State 0 で先に削除されるため、失敗時に旧データは残らない
+※ 既存宛先は State 0 で先に削除されるため、どちらのケースでも旧データは残らない
 
 ### CSV取込ワークフロー（登録フローと共通）
 
 ```mermaid
 flowchart LR
     S0[State 0<br/>既存宛先DELETE] --> S1[State 1<br/>CSV分割] --> S2[State 2<br/>Map State<br/>並列INSERT] --> S3[State 3<br/>status→送信予約済<br/>+ 送信WF自動起動]
-    S0 --> |失敗| ERR[Catch:<br/>全宛先DELETE<br/>→ status→取込失敗]
-    S1 --> |失敗| ERR
-    S2 --> |失敗| ERR
+    S1 --> |CSVバリデーションエラー| ERR[Catch:<br/>全宛先DELETE<br/>→ status→取込失敗]
+    S0 & S1 & S2 & S3 --> |システムエラー| SYS[取込中のまま<br/>CloudWatchで検知]
 ```
 
 ---
@@ -177,7 +174,8 @@ stateDiagram-v2
         送信予約済_B --> 取込中_B : CSV差替（送信WF停止）
         取込失敗_B --> 取込中_B : CSV差替（復旧）
         取込中_B --> 送信予約済_B2 : 成功→送信WF自動起動
-        取込中_B --> 取込失敗_B : 失敗→全宛先DELETE
+        取込中_B --> 取込失敗_B : CSVバリデーションエラー→全宛先DELETE
+        note right of 取込中_B : システムエラー時は\n取込中のまま滞留\n（CloudWatchで検知）
     }
 ```
 
