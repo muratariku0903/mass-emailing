@@ -24,6 +24,7 @@
 | ステータス | 説明 |
 |---|---|
 | 未送信 | 登録済み、未処理 |
+| 送信中 | SES呼び出し前にマーク（重複送信防止用） |
 | 送信済 | SESで送信完了 |
 | 送信失敗 | 送信処理でエラーが発生 |
 | バウンス | 送信後にバウンスが発生（将来拡張） |
@@ -57,14 +58,19 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> 未送信 : CSV取込
 
-    未送信 --> 送信済 : SES送信成功
-    未送信 --> 送信失敗 : SES送信エラー / DLQ
+    未送信 --> 送信中 : SES呼び出し前にマーク
+    送信中 --> 送信済 : SES送信成功
+    送信中 --> 送信失敗 : SES送信エラー
+
+    未送信 --> 送信失敗 : DLQ（3回リトライ失敗）
 
     送信済 --> バウンス : バウンス通知（将来拡張）
 
     送信済 --> [*]
     送信失敗 --> [*]
     バウンス --> [*]
+
+    note right of 送信中 : リトライ時は送信中の宛先を\nスキップし重複送信を防止
 ```
 
 ---
@@ -170,6 +176,7 @@ sequenceDiagram
     rect rgb(240, 255, 240)
     Note over SQS, SES: メール送信処理
     SQS->>Lambda: Event Source Mapping（MaxConcurrency制御）
+    Lambda->>RDS: 宛先status → 送信中（重複送信防止）
     Lambda->>SES: SendBulkEmail（50件一括）
     SES-->>Lambda: 送信結果
     Lambda->>RDS: 宛先status → 送信済 / 送信失敗

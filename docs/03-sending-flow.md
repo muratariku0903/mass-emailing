@@ -37,22 +37,23 @@ sequenceDiagram
     rect rgb(240, 255, 240)
     Note over SQS, SES: メール送信処理
     SQS->>Lambda: Event Source Mapping（MaxConcurrency制御）
+    Lambda->>RDS: 宛先status → 送信中（重複送信防止）
     Lambda->>SES: SendBulkEmail（50件一括）
     SES-->>Lambda: 送信結果
-    Lambda->>RDS: 宛先status→送信済 / 送信失敗
+    Lambda->>RDS: 宛先status → 送信済 / 送信失敗
     end
 
     rect rgb(255, 255, 230)
     Note over SQS, DLQ: 失敗処理
     SQS-->>DLQ: 3回失敗でDLQへ
     DLQ->>Lambda: DLQ処理Lambda
-    Lambda->>RDS: 宛先status→送信失敗
+    Lambda->>RDS: 宛先status → 送信失敗
     end
 
     rect rgb(245, 245, 245)
     Note over SFn, RDS: State 4-5: 完了待ち & 最終更新
     loop 60秒間隔
-        SFn->>RDS: 未完了（未送信）の宛先件数を確認
+        SFn->>RDS: 未完了（未送信 / 送信中）の宛先件数を確認
     end
     SFn->>RDS: sent_count/failed_count集計、status→送信完了
     end
@@ -100,7 +101,7 @@ flowchart TD
 
     subgraph State4 [State 4: WaitForCompletion]
         S4[Wait: 60秒待機]
-        S4 --> S4_2[Lambda: 未完了件数を確認]
+        S4 --> S4_2["Lambda: 未完了件数を確認<br/>（未送信 + 送信中 = 0?）"]
         S4_2 --> S4_3{残件数 = 0?}
         S4_3 -->|いいえ| S4
         S4_3 -->|はい| S5
@@ -121,9 +122,10 @@ flowchart TD
 ```mermaid
 flowchart LR
     SQS[SQS<br/>メール送信キュー] -->|Event Source Mapping<br/>BatchSize=1<br/>MaxConcurrency=4| Lambda[Lambda<br/>メール送信]
-    Lambda -->|SendBulkEmail<br/>50件一括| SES[AWS SES]
+    Lambda -->|"① status→送信中"| RDS[(RDS)]
+    Lambda -->|"② SendBulkEmail<br/>50件一括"| SES[AWS SES]
     SES -->|送信結果| Lambda
-    Lambda -->|status更新| RDS[(RDS)]
+    Lambda -->|"③ status→送信済/送信失敗"| RDS
 
     SQS -->|3回失敗| DLQ[SQS DLQ]
     DLQ --> DLQLambda[Lambda<br/>DLQ処理]
@@ -148,13 +150,18 @@ flowchart LR
 
 ※ 1メッセージあたり最大50件の宛先を含む
 
-### Lambda処理
+### Lambda処理（RDS更新先行方式 — 重複送信防止）
 
-1. SES SendBulkEmail API を呼び出し（50件一括）
-2. レスポンスから各宛先の送信結果を確認
-3. RDSに送信ステータスを一括UPDATE
+1. RDS: 対象宛先のステータスを `未送信` → `送信中` に一括UPDATE（重複送信防止）
+2. SES SendBulkEmail API を呼び出し（50件一括）
+3. レスポンスから各宛先の送信結果を確認
+4. RDSに送信ステータスを一括UPDATE
    - 成功: status = 送信済, sent_at = now
    - 失敗: status = 送信失敗, error_message = ...
+
+**重複送信防止の仕組み**:
+- SES呼び出し前にステータスを `送信中` にすることで、Lambda がクラッシュして SQS メッセージがリトライされても、`送信中` の宛先はスキップされる
+- ステップ1の直後にクラッシュした場合、メールは未送信だが `送信中` のまま残る（重複送信よりも未送信の方が影響が軽い）
 
 ---
 
