@@ -198,16 +198,31 @@ SES通知の `mail.tags` にこれらが含まれるため、ハンドラーLamb
 送信Lambda が `SendBulkEmail` のレスポンスから各宛先の `MessageId` を `notification_recipients.ses_message_id` に保存する。
 タグが取得できない場合でも、`ses_message_id` でレコードを特定できる。
 
+### Configuration Set のイベントタイプ選択
+
+SES Configuration Set では購読するイベントタイプを選択できる。
+全イベントを購読するとLambda実行数が送信件数と同等になるため、**Bounce と Complaint のみ**に絞る。
+
+| イベントタイプ | 200K送信あたりの想定件数 | 購読 | 理由 |
+|---|---|---|---|
+| Send | ~200,000 | **しない** | 送信Lambdaで同期的に把握済み |
+| Delivery | ~195,000 | **しない** | 同上 |
+| **Bounce** | **~2,000**（1%想定） | **する** | バウンス管理に必須 |
+| **Complaint** | **~200**（0.1%想定） | **する** | 苦情管理に必須 |
+| Open / Click | 数万〜 | **しない** | トラッキング不要の要件 |
+
+→ 1キャンペーンあたりのイベント数は**最大でも数千件**に収まる。
+
 ### イベント処理フロー
 
 ```
-[SES] → Configuration Set → Event Destination
+[SES] → Configuration Set (Bounce/Complaint のみ)
   → [SNS Topic]
     → [SQS Queue]
       → [Lambda: Bounce/Complaint Handler]
 
 Lambda処理:
-  1. SQSメッセージからSES通知をパース
+  1. SQSメッセージからSES通知をパース（BatchSizeにより1回で最大10件）
   2. mail.tags から campaign_id, recipient_id を取得
      （取得できない場合は ses_message_id で notification_recipients を逆引き）
   3. notification_recipients を更新:
@@ -216,6 +231,26 @@ Lambda処理:
   4. bounceType = 'Permanent' or notificationType = 'Complaint' の場合:
      - suppression_list に UPSERT（既存なら無視）
 ```
+
+### SQS → Lambda のスロットリング設定
+
+バウンスは送信直後に集中するため、SQS → Lambda の同時実行数を制限してRDSへの接続圧を抑制する。
+
+| 設定項目 | 値 | 効果 |
+|---|---|---|
+| SQS BatchSize | 10 | 1回のLambda実行で最大10件のイベントをまとめて処理 |
+| Lambda MaximumConcurrency | 2〜3 | 同時実行数を制限し、RDSへの同時接続を最大3本に抑制 |
+
+**処理量の見積もり（200K送信・バウンス率1%の場合）**:
+
+```
+バウンス2,000件 + 苦情200件 = 2,200イベント
+÷ BatchSize 10 = 220回のLambda実行
+÷ MaximumConcurrency 3 = 最大3並列で処理
+→ RDSへの同時接続は常に最大3本
+```
+
+送信用Lambda（MaximumConcurrency=4）と合わせても、RDS Proxyの接続プール内に十分収まる。
 
 ### suppression_list の活用タイミング
 
