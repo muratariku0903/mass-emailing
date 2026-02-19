@@ -84,9 +84,13 @@ CREATE INDEX idx_recipients_campaign_status
 CREATE INDEX idx_recipients_campaign_id
   ON notification_recipients (campaign_id, id);
 
--- SESイベント紐付け用（バウンス/苦情ハンドラーからの逆引き）
+-- SESイベント紐付け用（バッチLambdaからの逆引き）
 CREATE INDEX idx_recipients_ses_message_id
   ON notification_recipients (ses_message_id);
+
+-- ソフトバウンス累計カウント用（メールアドレス単位のキャンペーン横断集計）
+CREATE INDEX idx_recipients_email_status
+  ON notification_recipients (email_address, status);
 
 -- 抑制リストテーブル
 CREATE UNIQUE INDEX idx_suppression_email
@@ -95,7 +99,8 @@ CREATE UNIQUE INDEX idx_suppression_email
 
 - `(campaign_id, status)` — ステータス別の集計・取得用（送信ワークフローの完了判定等）
 - `(campaign_id, id)` — ページネーション用（Map State でのバッチ読み取り）
-- `(ses_message_id)` — SESイベント通知からの宛先レコード特定用
+- `(ses_message_id)` — SESイベントからの宛先レコード特定用（フォールバック経路）
+- `(email_address, status)` — バッチLambdaでのソフトバウンス累計カウント用
 - `suppression_list(email_address)` — CSV取込時の抑制リスト突合用（UNIQUE制約兼用）
 
 ---
@@ -150,24 +155,52 @@ Hard Bounceや苦情が発生したアドレスをキャンペーン横断で管
 | DB格納値 | 意味 |
 |---|---|
 | hard_bounce | Hard Bounce（恒久的な配信不能）により自動登録 |
+| soft_bounce_limit | Soft Bounce が閾値（例: 3回）を超過して自動登録 |
 | complaint | 受信者のスパム報告により自動登録 |
 | manual | スタッフによる手動登録 |
 
 ---
 
-## バウンス・苦情イベントの紐付け設計
+## SESイベント処理設計
 
-### SESイベント通知から宛先レコードへのマッチング
+### イベントの用途と設計方針
 
-SESからのバウンス/苦情通知は非同期で届く。`notification_recipients` のレコードを特定するため、以下2つの経路を用意する。
+SESイベントの用途は以下の2つ。いずれもリアルタイム性は不要のため、**全イベントを Kinesis Data Firehose → S3 に蓄積する単一パイプライン**で処理する。
 
-**経路1: SESメッセージタグによる直引き（推奨）**
+| 用途 | 必要なイベント | 処理方式 |
+|---|---|---|
+| BI（QuickSight）で送信結果の進捗確認 | 全イベント（Send, Delivery, Bounce, Complaint, Open, Click） | S3 → Athena → QuickSight |
+| バウンス管理（suppression_list 更新） | Bounce, Complaint | S3 → 定期バッチ Lambda → RDS |
+
+### アーキテクチャ
+
+```
+[SES Configuration Set]
+  └─ Event Destination: Send, Delivery, Bounce, Complaint, Open, Click
+       → [Kinesis Data Firehose]
+            → [S3: s3://bucket/ses-events/year=YYYY/month=MM/day=DD/]
+                 │
+                 ├─ [Athena] → [QuickSight]
+                 │    送信進捗ダッシュボード（配信成功率・バウンス率・開封率・クリック率等）
+                 │
+                 └─ [EventBridge Scheduler] → [Lambda: Bounce Aggregator]
+                      → notification_recipients ステータス更新
+                      → suppression_list 登録判定
+```
+
+イベント駆動（SNS → SQS → Lambda）ではなくバッチ蓄積方式を採用する理由:
+- Open/Click を含めると1キャンペーンで数万〜十数万件のイベントが発生する
+- イベント駆動では大量のLambda実行が発生し、RDS接続圧とコストが問題になる
+- Firehose → S3 方式ではイベント単位のLambda起動が一切発生しない
+- バウンス管理もリアルタイム性不要のため、バッチ処理で十分対応可能
+
+### SESメッセージタグ（イベントから宛先レコードを特定するためのキー）
 
 送信Lambda が `SendBulkEmail` 呼び出し時に、SESメッセージタグとして `campaign_id` と `recipient_id` を付与する。
-SES通知の `mail.tags` にこれらが含まれるため、ハンドラーLambda側で直接レコードを特定できる。
+S3 に蓄積されたイベント JSON の `mail.tags` にこれらが含まれるため、バッチ Lambda 側で `notification_recipients` のレコードを直接特定できる。
 
 ```json
-// SESバウンス通知の構造（抜粋）
+// SESイベント通知の構造（抜粋）
 {
   "notificationType": "Bounce",
   "bounce": {
@@ -193,64 +226,39 @@ SES通知の `mail.tags` にこれらが含まれるため、ハンドラーLamb
 }
 ```
 
-**経路2: ses_message_id による逆引き（フォールバック）**
+`ses_message_id` による逆引きはフォールバック経路として利用する。
+送信Lambda が `SendBulkEmail` のレスポンスから各宛先の `MessageId` を `notification_recipients.ses_message_id` に保存しておくことで、タグが取得できない場合でもレコードを特定できる。
 
-送信Lambda が `SendBulkEmail` のレスポンスから各宛先の `MessageId` を `notification_recipients.ses_message_id` に保存する。
-タグが取得できない場合でも、`ses_message_id` でレコードを特定できる。
+### BI: QuickSight による送信結果の可視化
 
-### Configuration Set のイベントタイプ選択
-
-SES Configuration Set では購読するイベントタイプを選択できる。
-全イベントを購読するとLambda実行数が送信件数と同等になるため、**Bounce と Complaint のみ**に絞る。
-
-| イベントタイプ | 200K送信あたりの想定件数 | 購読 | 理由 |
-|---|---|---|---|
-| Send | ~200,000 | **しない** | 送信Lambdaで同期的に把握済み |
-| Delivery | ~195,000 | **しない** | 同上 |
-| **Bounce** | **~2,000**（1%想定） | **する** | バウンス管理に必須 |
-| **Complaint** | **~200**（0.1%想定） | **する** | 苦情管理に必須 |
-| Open / Click | 数万〜 | **しない** | トラッキング不要の要件 |
-
-→ 1キャンペーンあたりのイベント数は**最大でも数千件**に収まる。
-
-### イベント処理フロー
+S3 上の SES イベント JSON を Athena テーブルとして定義し、QuickSight から直接クエリする。
+RDS にはBI用のカラム（open_count, click_count 等）を持たず、**BI の集計データは S3 + Athena に一元化**する。
 
 ```
-[SES] → Configuration Set (Bounce/Complaint のみ)
-  → [SNS Topic]
-    → [SQS Queue]
-      → [Lambda: Bounce/Complaint Handler]
+QuickSight で可視化できる指標:
+  - キャンペーン別: 送信数 / 配信成功数 / バウンス数 / 開封数 / クリック数
+  - バウンス率・苦情率の推移
+  - 開封率・クリック率
+```
 
-Lambda処理:
-  1. SQSメッセージからSES通知をパース（BatchSizeにより1回で最大10件）
-  2. mail.tags から campaign_id, recipient_id を取得
-     （取得できない場合は ses_message_id で notification_recipients を逆引き）
+### バウンス管理: 定期バッチ Lambda による suppression_list 更新
+
+EventBridge Scheduler で定期実行（例: 日次）する Lambda が、Athena 経由で S3 上の Bounce/Complaint イベントを集計し RDS を更新する。
+
+```
+Lambda: Bounce Aggregator 処理:
+  1. Athena で前回処理以降の Bounce/Complaint イベントを抽出
+  2. mail.tags の campaign_id, recipient_id で notification_recipients を特定
+     （タグ取得不可の場合は ses_message_id で逆引き）
   3. notification_recipients を更新:
      - status → 'バウンス' or '苦情'
      - bounce_type, bounce_sub_type, diagnostic_code, bounce_at 等を記録
-  4. bounceType = 'Permanent' or notificationType = 'Complaint' の場合:
-     - suppression_list に UPSERT（既存なら無視）
+  4. suppression_list 登録判定:
+     - Hard Bounce → 即時登録
+     - Complaint → 即時登録
+     - Soft Bounce → メールアドレス単位で累計バウンス回数をチェック
+       → 閾値（例: 3回）以上で登録（reason = 'soft_bounce_limit'）
 ```
-
-### SQS → Lambda のスロットリング設定
-
-バウンスは送信直後に集中するため、SQS → Lambda の同時実行数を制限してRDSへの接続圧を抑制する。
-
-| 設定項目 | 値 | 効果 |
-|---|---|---|
-| SQS BatchSize | 10 | 1回のLambda実行で最大10件のイベントをまとめて処理 |
-| Lambda MaximumConcurrency | 2〜3 | 同時実行数を制限し、RDSへの同時接続を最大3本に抑制 |
-
-**処理量の見積もり（200K送信・バウンス率1%の場合）**:
-
-```
-バウンス2,000件 + 苦情200件 = 2,200イベント
-÷ BatchSize 10 = 220回のLambda実行
-÷ MaximumConcurrency 3 = 最大3並列で処理
-→ RDSへの同時接続は常に最大3本
-```
-
-送信用Lambda（MaximumConcurrency=4）と合わせても、RDS Proxyの接続プール内に十分収まる。
 
 ### suppression_list の活用タイミング
 
