@@ -970,29 +970,139 @@
 
 ## 補足: テスト環境の考慮事項
 
+### SES Mailbox Simulator（テスト用メールアドレス）
+
+負荷テスト・結合テストでは、**実際のメールアドレスではなく、SESが公式に提供するMailbox Simulatorアドレスを使用する**。
+
+#### 仕組み
+
+Mailbox Simulatorに送信されたメールはSES内部で受理・処理されるが、**実際のメールボックスには一切配信されない**。SES内部で完結し、イベント通知（Delivery, Bounce, Complaint等）は本番と同様に発生するため、送信フローの検証に適している。
+
+```
+送信Lambda → SES → SES内部で受理・処理 → 破棄（どこにも配信されない）
+                         │
+                         └→ イベント通知は正常に発生する
+                            （Delivery, Bounce, Complaint 等）
+```
+
+#### シミュレーターアドレス一覧
+
+| アドレス | 動作 | 主な用途 |
+|---|---|---|
+| `success@simulator.amazonses.com` | 正常配信をシミュレート。Deliveryイベント発生 | 正常系テスト・負荷テスト |
+| `bounce@simulator.amazonses.com` | Hard Bounceをシミュレート（SMTP 550 5.1.1） | バウンス検知・suppression_list登録テスト |
+| `complaint@simulator.amazonses.com` | スパム報告をシミュレート（RFC 5965準拠） | 苦情処理テスト |
+| `suppressionlist@simulator.amazonses.com` | SESグローバル抑制リスト登録済みをシミュレート | 抑制リスト動作テスト |
+| `ooto@simulator.amazonses.com` | 自動応答（不在通知）をシミュレート（RFC 3834準拠） | 自動応答ハンドリングテスト |
+
+#### ラベリング機能（20万件のユニークアドレス生成）
+
+シミュレーターは `+label` によるラベリングをサポートしている。これにより、**1つのシミュレーターアドレスから任意の数のユニークアドレスを生成できる**。20万件の負荷テスト用CSVは以下のように作成する。
+
+```
+email
+success+000001@simulator.amazonses.com
+success+000002@simulator.amazonses.com
+success+000003@simulator.amazonses.com
+...
+success+200000@simulator.amazonses.com
+```
+
+バウンス・苦情のテストでは、一部の行にシナリオ別アドレスを混在させる。
+
+```
+email
+success+000001@simulator.amazonses.com   ← 正常配信
+success+000002@simulator.amazonses.com   ← 正常配信
+bounce+000003@simulator.amazonses.com    ← Hard Bounce発生
+complaint+000004@simulator.amazonses.com ← 苦情発生
+success+000005@simulator.amazonses.com   ← 正常配信
+...
+```
+
+VERP（Variable Envelope Return Path）テストやバウンス照合の検証にも活用可能。
+
+#### クォータ・レピュテーション・課金への影響
+
+| 項目 | 影響 | 備考 |
+|---|---|---|
+| 日次送信クォータ | **消費しない** | 20万件送ってもクォータは減らない |
+| 送信レート制限 | **適用される** | 200通/秒の制約は本番と同じ。スループット検証が正確にできる |
+| バウンス率 | **影響しない** | bounce@ 宛に送信してもレピュテーションに傷がつかない |
+| 苦情率 | **影響しない** | complaint@ 宛に送信してもレピュテーションに傷がつかない |
+| 課金 | **課金対象** | 通常のメールと同じ $0.10/1,000通（20万件で約$20） |
+
+> **ポイント**: 送信レートの制約は本番と同条件のため、「200通/秒 × 4並列で約17分」というスループットの検証が正確にできる。一方、クォータやレピュテーションには影響しないため、安全にテストを繰り返せる。
+
+---
+
 ### SES サンドボックスモードでの制約
 
-| 制約 | 対応 |
-|---|---|
-| 送信先は検証済みアドレスのみ | テスト用に検証済みアドレスを複数登録（SES の Email Simulator アドレスを活用） |
-| 送信レート 1通/秒 | 少数件テストはサンドボックスで実施。負荷テストはプロダクションアクセス取得後 |
-| 日次送信数 200通 | 段階1（100件）まではサンドボックスで可能 |
+| 制約 | サンドボックス | プロダクション |
+|---|---|---|
+| 送信レート | 1通/秒 | 申請したレート（200通/秒等） |
+| 日次送信数 | 200通/日 | 申請したクォータ（200,000通/日等） |
+| 送信先 | 検証済みアドレスのみ | 任意のアドレス |
+| Mailbox Simulator | **利用可能** | **利用可能** |
 
-### SES Email Simulator アドレス
+#### テスト段階とSESモードの対応
 
-| アドレス | 用途 |
-|---|---|
-| `success@simulator.amazonses.com` | 正常送信のテスト |
-| `bounce@simulator.amazonses.com` | バウンスのテスト |
-| `complaint@simulator.amazonses.com` | 苦情のテスト |
-| `suppressionlist@simulator.amazonses.com` | SES 抑制リスト登録のテスト |
-| `ooto@simulator.amazonses.com` | 自動応答のテスト |
+| 段階 | 件数 | SESモード | 理由 |
+|---|---|---|---|
+| 結合テスト | 10件程度 | サンドボックスで可能 | 日次200通以内。Simulatorアドレスは検証不要で利用可 |
+| 負荷テスト 段階1 | 100件 | サンドボックスで可能 | 日次200通以内 |
+| 負荷テスト 段階2 | 1,000件 | **プロダクション必須** | 日次200通を超過 |
+| 負荷テスト 段階3 | 10,000件 | **プロダクション必須** | レート1通/秒では約2.8時間かかる |
+| 負荷テスト 段階4 | 200,000件 | **プロダクション必須** | レート1通/秒では約2.3日かかる |
+
+> **注意**: 20万件の負荷テストにはプロダクションアクセスが必須。サンドボックスでは送信レートが1通/秒のため、200,000秒（約2.3日）かかり現実的ではない。プロダクションアクセスの承認には通常24時間程度を要するため、テスト計画時にスケジュールに含めること。
+
+---
+
+### 負荷テストの実施手順
+
+```
+1. SESプロダクションアクセスを取得（送信レート200通/秒以上を申請）
+2. テスト用CSV生成
+   - 正常系: success+000001〜success+200000@simulator.amazonses.com
+   - 混在系: success/bounce/complaint を割合で混在
+3. 通常の登録フローでキャンペーンを作成・実行
+4. SESが全件受理 → 内部で破棄（実際の配信なし）
+5. 以下を計測・記録
+   - 送信スループット（通/秒）
+   - 全件送信完了までの時間
+   - RDS CPU/メモリ/接続数
+   - Lambda 同時実行数・メモリ使用量
+   - SQS メッセージ滞留数
+6. bounce/complaint 混在CSVでバウンス・苦情処理パイプラインの動作確認
+```
+
+#### 負荷テストのコスト見積もり
+
+| 項目 | 数量 | コスト |
+|---|---|---|
+| SES送信料（$0.10/1,000通） | 200,000通 | ~$20 |
+| Lambda 実行 | CSV取込 + 送信 | ~$2-3 |
+| SQS メッセージ | 4,000メッセージ | ~$0.20 |
+| Step Functions | 2ワークフロー | ~$0.05 |
+| **1回の負荷テスト合計** | | **~$23** |
+
+※ RDSインスタンス・RDS Proxyは常時稼働のため別途固定費
+
+---
 
 ### テストデータ
 
-| データ | 内容 |
-|---|---|
-| 正常CSV | 各段階の件数（100/1,000/10,000/200,000）で準備 |
-| 不正CSV | エンコーディングエラー、ヘッダーなし、形式不正の各パターン |
-| 混在CSV | 正常行と不正行が混在（バリデーション動作確認用） |
-| suppression対象CSV | suppression_list に登録済みアドレスを含むCSV |
+| データ | 内容 | アドレス例 |
+|---|---|---|
+| 正常CSV（各段階） | 100/1,000/10,000/200,000件 | `success+{連番}@simulator.amazonses.com` |
+| バウンス混在CSV | 正常95% + bounce5% | `bounce+{連番}@simulator.amazonses.com` を5%混在 |
+| 苦情混在CSV | 正常99.9% + complaint0.1% | `complaint+{連番}@simulator.amazonses.com` を0.1%混在 |
+| 不正CSV | エンコーディングエラー、ヘッダーなし、形式不正 | — |
+| 混在CSV | 正常行と不正行が混在 | バリデーション動作確認用 |
+| suppression対象CSV | suppression_list に登録済みアドレスを含む | 任意のアドレス（suppression_listに事前登録） |
+
+#### 参考: SES Mailbox Simulator 公式ドキュメント
+
+- [Sending test emails in Amazon SES with the simulator](https://docs.aws.amazon.com/ses/latest/dg/send-an-email-from-console.html)
+- [AWS SES Load Testing Sample（GitHub）](https://github.com/aws-samples/load-testing-sample-amazon-ses)
